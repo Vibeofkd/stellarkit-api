@@ -21,6 +21,16 @@ const POLL_INTERVAL_MS = parseInt(process.env.CONTRACT_POLL_INTERVAL_MS || "1000
 let _intervalId = null;
 let _lastLedger = 0;
 
+// Dependency tracking: Map<sourceContractId, Map<targetContractId, {contractId, callCount, lastCallLedger, lastCallAt}>>
+const _dependencies = new Map();
+
+// Simple TTL cache for dependency query responses (60 second TTL).
+const DEPENDENCY_CACHE_TTL_MS = 60 * 1000;
+const _dependencyCache = new Map();
+
+// StrKey contract address form, e.g. "C..." (56 chars).
+const CONTRACT_ID_RE = /^C[A-Z2-7]{55}$/;
+
 /**
  * Decode a raw xdr.ScVal entry to a plain string/number/object, falling back
  * to the base-64 XDR representation when native conversion is unavailable.
@@ -68,6 +78,113 @@ function normaliseEvent(rawEvent) {
 }
 
 /**
+ * Recursively collect Soroban contract IDs (StrKey "C..." form) referenced in
+ * an arbitrary decoded value.
+ */
+function collectContractIds(value, acc) {
+  if (value == null) return acc;
+  if (typeof value === "string") {
+    if (CONTRACT_ID_RE.test(value)) acc.add(value);
+    return acc;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectContractIds(item, acc);
+    return acc;
+  }
+  if (typeof value === "object") {
+    for (const key of Object.keys(value)) collectContractIds(value[key], acc);
+  }
+  return acc;
+}
+
+/**
+ * Inspect a normalised event payload and record any cross-contract calls --
+ * i.e. references to contract IDs other than the emitting contract.
+ */
+function recordCrossContractCalls(payload) {
+  if (!payload || !payload.contractId) return;
+
+  const referenced = new Set();
+  collectContractIds(payload.topic, referenced);
+  collectContractIds(payload.value, referenced);
+  referenced.delete(payload.contractId);
+
+  if (referenced.size === 0) return;
+
+  let targets = _dependencies.get(payload.contractId);
+  if (!targets) {
+    targets = new Map();
+    _dependencies.set(payload.contractId, targets);
+  }
+
+  const ledger = payload.ledger != null ? payload.ledger : null;
+  const at = new Date().toISOString();
+
+  for (const targetId of referenced) {
+    const existing = targets.get(targetId);
+    if (existing) {
+      existing.callCount += 1;
+      if (
+        ledger != null &&
+        (existing.lastCallLedger == null || ledger > existing.lastCallLedger)
+      ) {
+        existing.lastCallLedger = ledger;
+        existing.lastCallAt = at;
+      }
+    } else {
+      targets.set(targetId, {
+        contractId: targetId,
+        callCount: 1,
+        lastCallLedger: ledger,
+        lastCallAt: at,
+      });
+    }
+  }
+
+  // Invalidate any cached dependency response for this contract.
+  _dependencyCache.delete(payload.contractId);
+}
+
+/**
+ * Build the cross-contract dependency graph for a contract.
+ *
+ * Returns null when the contract does not exist so callers can respond with a
+ * 404. Successful responses are cached for 60 seconds.
+ *
+ * @param {string} contractId  Soroban contract ID.
+ * @returns {Promise<{contractId: string, dependencies: Array}|null>}
+ */
+async function getContractDependencies(contractId) {
+  const cached = _dependencyCache.get(contractId);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.value;
+  }
+
+  const contract = await getContractById(contractId);
+  if (!contract) return null;
+
+  const targets = _dependencies.get(contractId);
+  const dependencies = targets
+    ? Array.from(targets.values())
+        .map((d) => ({
+          contractId: d.contractId,
+          callCount: d.callCount,
+          lastCallLedger: d.lastCallLedger,
+          lastCallAt: d.lastCallAt,
+        }))
+        .sort((a, b) => b.callCount - a.callCount)
+    : [];
+
+  const value = { contractId, dependencies };
+  _dependencyCache.set(contractId, {
+    value,
+    expiresAt: Date.now() + DEPENDENCY_CACHE_TTL_MS,
+  });
+
+  return value;
+}
+
+/**
  * Fetch new contract events since `_lastLedger` and deliver them.
  */
 async function poll() {
@@ -86,6 +203,7 @@ async function poll() {
       try {
         const payload = normaliseEvent(rawEvent);
         await deliverContractEvent(payload);
+        recordCrossContractCalls(payload);
 
         if (rawEvent.ledger > _lastLedger) {
           _lastLedger = rawEvent.ledger;
@@ -267,4 +385,4 @@ async function getContractById(contractId) {
   }
 }
 
-module.exports = { start, stop, poll, normaliseEvent, getContractById };
+module.exports = { start, stop, poll, normaliseEvent, getContractById, getContractDependencies };

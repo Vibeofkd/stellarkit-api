@@ -17,8 +17,12 @@ const {
 const { validateEffectType } = require("../utils/effectTypes");
 const { accountSummaryRateLimiter } = require("../middleware/rateLimiter");
 const registerParamValidation = require("../middleware/validateRouteParams");
+const minResponseTime = require("../middleware/minResponseTime");
 const { startHorizonTimer, stopHorizonTimer } = require("../middleware/requestLogger");
 registerParamValidation(router);
+// Pad synchronous format-validation 400s so they cannot be distinguished from
+// Horizon-backed rejections by response time (account-enumeration hardening).
+router.use(minResponseTime);
 
 /**
  * Calls a Horizon-backed async function and records the duration on req
@@ -47,7 +51,7 @@ const axios = require("axios");
 const { Asset } = require("@stellar/stellar-sdk");
 const { normalizeAsset, normalizeAssetFromString } = require("../utils/asset");
 const { isNativeAsset, isNonNativeAsset } = require("../utils/assetHelpers");
-const { getAssetMetadataFromToml } = require("../utils/tomlResolver");
+const { getAssetMetadataFromToml, fetchStellarToml } = require("../utils/tomlResolver");
 const { formatBalance } = require("../utils/formatBalance");
 const { parseStellarAmount } = require("../utils/parseStellarAmount");
 const { formatAmount } = require("../utils/formatAmount");
@@ -608,6 +612,57 @@ router.get("/:id/signing-keys", async (req, res, next) => {
 });
 
 /**
+ * GET /account/:id/delegated-signers
+ * Returns additional account signers and whether each signer account is multisig.
+ */
+router.get("/:id/delegated-signers", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const account = await server.loadAccount(id);
+    const delegatedSigners = (account.signers || []).filter(
+      (signer) =>
+        signer.key !== account.id &&
+        (!signer.type || normalizeSignerType(signer.type) === "ed25519_public_key"),
+    );
+
+    const resolvedSigners = await Promise.all(
+      delegatedSigners.map(async (signer) => {
+        const signerAccount = await server.loadAccount(signer.key);
+        const signerEntries = signerAccount.signers || [];
+        const masterSigner = signerEntries.find(
+          (entry) => entry.key === signerAccount.id,
+        );
+        const masterWeight = Number(
+          masterSigner?.weight ?? signerAccount.master_weight ?? 0,
+        );
+        const thresholds = signerAccount.thresholds || {};
+        const isMultisig =
+          signerEntries.length > 1 ||
+          Number(thresholds.low_threshold ?? 0) > masterWeight ||
+          Number(thresholds.med_threshold ?? 0) > masterWeight ||
+          Number(thresholds.high_threshold ?? 0) > masterWeight;
+
+        return {
+          key: signer.key,
+          weight: Number(signer.weight) || 0,
+          type: normalizeSignerType(signer.type),
+          isMultisig,
+        };
+      }),
+    );
+
+    return success(res, {
+      accountId: account.id,
+      delegatedSigners: resolvedSigners,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
  * GET /account/:id/multisig-info
  *
  * Returns a human-readable summary of an account's multisig configuration,
@@ -898,9 +953,14 @@ router.get("/:id/operations", async (req, res, next) => {
 
     return success(res, {
       operations,
-      total: operations.length,
-      limit,
-      cursor: operations.length ? nextCursor : null,
+    }, {
+      meta: {
+        count: operations.length,
+        limit,
+        order: "desc",
+        nextCursor: operations.length ? nextCursor : null,
+        hasMore: nextCursor !== null,
+      },
     });
   } catch (err) {
     if (err && err.response && err.response.status === 404) {
@@ -959,7 +1019,7 @@ router.get("/:id/payments", async (req, res, next) => {
       "subentry-health", "merge-eligibility", "offers", "payments",
       "operation-breakdown", "offer-history", "timeline", "data",
       "pool-positions", "risk-score", "trustline-health", "age", "volume",
-      "payment-summary", "operations",
+      "payment-summary", "net-flow", "operations",
     ];
     if (reservedWords.includes(id)) {
       return next();
@@ -1098,10 +1158,14 @@ router.get("/:id/payments", async (req, res, next) => {
 
     return success(res, {
       payments,
-      items: payments,
-      total: payments.length,
-      limit,
-      cursor: payments.length ? nextCursor : null,
+    }, {
+      meta: {
+        count: payments.length,
+        limit,
+        order,
+        nextCursor: payments.length ? nextCursor : null,
+        hasMore: nextCursor !== null,
+      },
     });
   } catch (err) {
     handleAccountNotFound(err, next, req.params.id);
@@ -1192,44 +1256,103 @@ router.get("/:id/trades", async (req, res, next) => {
 
     const data = {
       trades,
-      items: trades,
-      total: trades.length,
-      limit,
-      cursor: trades.length ? nextCursor : null,
     };
 
-    cacheService.set(cacheKey, data, cacheTTL.trades);
+    const metadata = {
+      meta: {
+        count: trades.length,
+        limit,
+        order,
+        nextCursor: trades.length ? nextCursor : null,
+        hasMore: nextCursor !== null,
+      },
+    };
+
+    cacheService.set(cacheKey, { ...data, ...metadata }, cacheTTL.trades);
     res.set("X-Cache", "MISS");
-    return success(res, data);
+    return success(res, data, metadata);
   } catch (err) {
     handleAccountNotFound(err, next, req.params.id);
   }
 });
 
 /**
+ * Maps a raw Horizon offer record onto the StellarKit normalised shape:
+ *   offerId, selling, buying, amount, price, lastModifiedLedger
+ *
+ * All amounts are formatted as seven-decimal strings (Stellar precision).
+ *
+ * Asset fields are controlled by the expandAssets option:
+ *   - expandAssets=false (default): asset code/issuer/type are spread directly
+ *     onto selling/buying (backward-compatible simplified shape), e.g.
+ *     `selling: { code, issuer, type, amount }`.
+ *   - expandAssets=true: full { code, issuer, type } asset objects are embedded
+ *     under selling.asset / buying.asset, e.g.
+ *     `selling: { asset: { code, issuer, type }, amount }`.
+ *
+ * @param {Object} offer - Raw Horizon offer record.
+ * @param {Object} [options]
+ * @param {boolean} [options.expandAssets=false] - Embed full asset objects.
+ * @returns {Object} Normalised camelCase offer.
+ */
+function mapOffer(offer, { expandAssets = false } = {}) {
+  // Derive a single decimal price string from price_r (n/d fraction) when
+  // available, falling back to the pre-computed price string from Horizon.
+  // Always format to 7 decimal places for consistency with other amounts.
+  let priceDecimal;
+  if (offer.price_r && offer.price_r.d && Number(offer.price_r.d) !== 0) {
+    priceDecimal = (Number(offer.price_r.n) / Number(offer.price_r.d)).toFixed(7);
+  } else {
+    priceDecimal = parseFloat(offer.price || "0").toFixed(7);
+  }
+
+  const sellingAsset = normalizeAsset(
+    offer.selling_asset_code,
+    offer.selling_asset_issuer,
+    offer.selling_asset_type,
+  );
+  const buyingAsset = normalizeAsset(
+    offer.buying_asset_code,
+    offer.buying_asset_issuer,
+    offer.buying_asset_type,
+  );
+  const amount = toSevenDecimalString(offer.amount);
+
+  return {
+    offerId: offer.id,
+    seller: offer.seller,
+    selling: expandAssets
+      ? { asset: sellingAsset, amount }
+      : { ...sellingAsset, amount },
+    buying: expandAssets ? { asset: buyingAsset } : buyingAsset,
+    amount,
+    price: priceDecimal,
+    lastModifiedLedger: formatLedgerSequence(offer.last_modified_ledger),
+  };
+}
+
+/**
  * GET /account/:id/offers
  *
- * Returns open DEX offers for an account.
+ * Returns live open DEX offers for an account by calling
+ * `server.offers().forAccount(id)` on the Stellar Horizon SDK.
+ * Each offer is mapped to the StellarKit normalised shape:
+ *   offerId, selling, buying, amount, price, lastModifiedLedger
+ *
+ * All amounts are formatted as seven-decimal strings (Stellar precision).
  *
  * Query params:
- *   - offerId       (string)  — fetch a single offer by its numeric ID
- *   - expandAssets  (boolean) — when "true", embeds full { code, issuer, type }
- *                               objects for both selling and buying assets.
- *                               When omitted (default), returns simplified
- *                               asset strings for backward compatibility.
- *   - limit, order, cursor   — standard pagination
+ *   - limit, cursor   — standard pagination
+ *   - offerId         — fetch a single offer by its numeric ID
  *
  * @example
- *   GET /account/:id/offers                        → simplified asset strings
- *   GET /account/:id/offers?expandAssets=true      → full asset objects
+ *   GET /account/:id/offers
+ *   GET /account/:id/offers?limit=50&cursor=12345
  */
 router.get("/:id/offers", async (req, res, next) => {
   try {
     const { id } = req.params;
     const { offerId } = req.query;
-
-    // expandAssets=true embeds full { code, issuer, type } objects on each offer.
-    // Any value other than the string "true" keeps the default simplified form.
     const expandAssets = req.query.expandAssets === "true";
 
     validateAccountId(id);
@@ -1237,7 +1360,7 @@ router.get("/:id/offers", async (req, res, next) => {
     if (offerId) {
       try {
         const offer = await server.offers().offer(offerId).call();
-        return success(res, offer);
+        return success(res, mapOffer(offer, { expandAssets }));
       } catch (err) {
         if (err.response && err.response.status === 404) {
           const notFound = new Error(
@@ -1252,82 +1375,29 @@ router.get("/:id/offers", async (req, res, next) => {
       }
     }
 
-    const { limit, order, cursor } = parsePaginationParams(req.query);
+    const { limit, cursor } = parsePaginationParams(req.query);
 
-    let query = server.offers().forAccount(id).limit(limit).order(order);
+    let query = server.offers().forAccount(id).limit(limit).order("desc");
     if (cursor) query = query.cursor(cursor);
 
     const offerResponse = await query.call();
-    const offers = (offerResponse.records || []).map((offer) => {
-      // Derive a single decimal price string from price_r (n/d fraction) when
-      // available, falling back to the pre-computed price string from Horizon.
-      // Always format to 7 decimal places for consistency with other amounts.
-      let priceDecimal;
-      if (offer.price_r && offer.price_r.d && Number(offer.price_r.d) !== 0) {
-        priceDecimal = (
-          Number(offer.price_r.n) / Number(offer.price_r.d)
-        ).toFixed(7);
-      } else {
-        priceDecimal = parseFloat(offer.price || "0").toFixed(7);
-      }
+    const records = offerResponse.records || [];
+    const offers = records.map((offer) => mapOffer(offer, { expandAssets }));
 
-      // Full normalized asset object { code, issuer, type }
-      const sellingAsset = normalizeAsset(
-        offer.selling_asset_code,
-        offer.selling_asset_issuer,
-        offer.selling_asset_type,
-      );
-      const buyingAsset = normalizeAsset(
-        offer.buying_asset_code,
-        offer.buying_asset_issuer,
-        offer.buying_asset_type,
-      );
-
-      if (expandAssets) {
-        // ?expandAssets=true — embed full asset objects on both sides
-        return {
-          id: offer.id,
-          seller: offer.seller,
-          selling: {
-            asset: sellingAsset,
-            amount: parseFloat(offer.amount || "0").toFixed(7),
-          },
-          buying: {
-            asset: buyingAsset,
-          },
-          price: priceDecimal,
-          lastModifiedLedger: offer.last_modified_ledger,
-        };
-      }
-
-      // Default (backward-compatible) — asset fields spread directly onto selling/buying
-      return {
-        id: offer.id,
-        seller: offer.seller,
-        selling: {
-          ...sellingAsset,
-          // Format to 7 decimal places (Stellar precision standard)
-          amount: parseFloat(offer.amount || "0").toFixed(7),
-        },
-        buying: buyingAsset,
-        // price is a 7-decimal string derived from the price_r fraction
-        price: priceDecimal,
-        // camelCase rename of last_modified_ledger
-        lastModifiedLedger: offer.last_modified_ledger,
-      };
-    });
-
-    const hasMore = (offerResponse.records || []).length === limit;
-    const nextCursor = hasMore
-      ? (offerResponse.records[offerResponse.records.length - 1] || {})
-        .paging_token
-      : null;
+    const nextCursor =
+      offers.length > 0 ? records[records.length - 1].paging_token || null : null;
 
     return success(res, {
+      offers,
       items: offers,
-      total: offers.length,
-      limit,
-      cursor: nextCursor,
+    }, {
+      meta: {
+        count: offers.length,
+        limit,
+        order: "desc",
+        nextCursor: nextCursor || null,
+        hasMore: nextCursor !== null,
+      },
     });
   } catch (err) {
     if (req.query.offerId) {
@@ -1434,6 +1504,8 @@ router.get("/:id/history", async (req, res, next) => {
     handleAccountNotFound(err, next, req.params.id);
   }
 });
+
+/**
  * Builds a normalized { code, issuer, type } asset shape from a raw Horizon
  * effect record. Returns null when the effect carries no asset information.
  *
@@ -1988,6 +2060,327 @@ router.get("/:id/analytics", async (req, res, next) => {
 });
 
 /**
+ * GET /account/:id/stale-offers
+ *
+ * Returns all open DEX offers for an account with staleness analysis.
+ * Each offer's price is compared against the current mid-market price from
+ * the Horizon order book. Offers where the price deviation exceeds the
+ * configured threshold are flagged as stale.
+ *
+ * Query params:
+ *   - threshold (number, default: 5) — deviation % above which an offer is stale
+ *
+ * Returns 404 when the account does not exist.
+ */
+router.get("/:id/stale-offers", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const rawThreshold = req.query.threshold !== undefined ? parseFloat(req.query.threshold) : 5;
+    const threshold = Number.isFinite(rawThreshold) && rawThreshold >= 0 ? rawThreshold : 5;
+
+    await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const offersResponse = await server.offers().forAccount(id).limit(200).order("desc").call();
+    const offerRecords = offersResponse.records || [];
+
+    const offers = await Promise.all(offerRecords.map(async (offer) => {
+      const sellingAsset = offer.selling_asset_type === "native"
+        ? Asset.native()
+        : new Asset(offer.selling_asset_code, offer.selling_asset_issuer);
+      const buyingAsset = offer.buying_asset_type === "native"
+        ? Asset.native()
+        : new Asset(offer.buying_asset_code, offer.buying_asset_issuer);
+
+      let offerPrice;
+      if (offer.price_r && offer.price_r.d && Number(offer.price_r.d) !== 0) {
+        offerPrice = Number(offer.price_r.n) / Number(offer.price_r.d);
+      } else {
+        offerPrice = parseFloat(offer.price || "0");
+      }
+
+      let marketPrice = null;
+      let priceDeviation = 0;
+      let stale = false;
+
+      try {
+        const ob = await server.orderbook(sellingAsset, buyingAsset).limit(1).call();
+        const bids = ob.bids || [];
+        const asks = ob.asks || [];
+        const bid = bids.length > 0 ? parseFloat(bids[0].price) : null;
+        const ask = asks.length > 0 ? parseFloat(asks[0].price) : null;
+
+        if (bid !== null && ask !== null) {
+          marketPrice = (bid + ask) / 2;
+        } else if (bid !== null) {
+          marketPrice = bid;
+        } else if (ask !== null) {
+          marketPrice = ask;
+        }
+
+        if (marketPrice !== null && marketPrice > 0) {
+          priceDeviation = Math.abs(offerPrice - marketPrice) / marketPrice * 100;
+          stale = priceDeviation > threshold;
+        }
+      } catch (_) {
+        // order book unavailable — staleness undetermined
+      }
+
+      return {
+        offerId: offer.id,
+        selling: normalizeAsset(offer.selling_asset_code, offer.selling_asset_issuer, offer.selling_asset_type),
+        buying: normalizeAsset(offer.buying_asset_code, offer.buying_asset_issuer, offer.buying_asset_type),
+        offerPrice: offerPrice.toFixed(7),
+        marketPrice: marketPrice !== null ? marketPrice.toFixed(7) : null,
+        priceDeviation: parseFloat(priceDeviation.toFixed(2)),
+        stale,
+      };
+    }));
+
+    return success(res, {
+      offers,
+      staleCount: offers.filter(o => o.stale).length,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
+ * GET /account/:id/portfolio
+ *
+ * Returns a full financial snapshot for an account: native XLM balance,
+ * all asset balances with current DEX prices, total portfolio value in XLM,
+ * open DEX offers, and liquidity pool positions.
+ *
+ * Returns 404 when the account does not exist.
+ */
+router.get("/:id/portfolio", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const account = await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const nativeEntry = (account.balances || []).find(b => isNativeAsset(b));
+    const nativeBalance = toSevenDecimalString(nativeEntry ? nativeEntry.balance : "0");
+    let totalValueXLM = parseFloat(nativeEntry ? nativeEntry.balance : "0");
+
+    // Asset balances with prices from DEX order book
+    const assetEntries = (account.balances || []).filter(b => isNonNativeAsset(b));
+    const assetBalances = await Promise.all(assetEntries.map(async (b) => {
+      const balance = parseFloat(b.balance);
+      let priceInXLM = null;
+      try {
+        const asset = new Asset(b.asset_code, b.asset_issuer);
+        const ob = await server.orderbook(asset, Asset.native()).limit(1).call();
+        const bids = ob.bids || [];
+        const asks = ob.asks || [];
+        const bid = bids.length > 0 ? parseFloat(bids[0].price) : null;
+        const ask = asks.length > 0 ? parseFloat(asks[0].price) : null;
+        if (bid !== null && ask !== null) priceInXLM = (bid + ask) / 2;
+        else if (bid !== null) priceInXLM = bid;
+        else if (ask !== null) priceInXLM = ask;
+      } catch (_) {
+        // order book unavailable
+      }
+      const valueInXLM = priceInXLM !== null ? balance * priceInXLM : null;
+      if (valueInXLM !== null) totalValueXLM += valueInXLM;
+
+      return {
+        asset: normalizeAsset(b.asset_code, b.asset_issuer, b.asset_type),
+        balance: toSevenDecimalString(b.balance),
+        priceInXLM: priceInXLM !== null ? priceInXLM.toFixed(7) : null,
+        valueInXLM: valueInXLM !== null ? valueInXLM.toFixed(7) : null,
+      };
+    }));
+
+    // Open DEX offers
+    const offersResponse = await server.offers().forAccount(id).limit(200).order("desc").call();
+    const openOffers = (offersResponse.records || []).map(offer => {
+      let priceDecimal;
+      if (offer.price_r && offer.price_r.d && Number(offer.price_r.d) !== 0) {
+        priceDecimal = (Number(offer.price_r.n) / Number(offer.price_r.d)).toFixed(7);
+      } else {
+        priceDecimal = parseFloat(offer.price || "0").toFixed(7);
+      }
+      return {
+        offerId: offer.id,
+        selling: {
+          asset: normalizeAsset(offer.selling_asset_code, offer.selling_asset_issuer, offer.selling_asset_type),
+          amount: parseFloat(offer.amount || "0").toFixed(7),
+        },
+        buying: {
+          asset: normalizeAsset(offer.buying_asset_code, offer.buying_asset_issuer, offer.buying_asset_type),
+        },
+        price: priceDecimal,
+      };
+    });
+
+    // Liquidity pool positions
+    const poolShareTrustlines = (account.balances || []).filter(
+      b => b.asset_type === "liquidity_pool_shares"
+    );
+    const poolPositions = [];
+    if (poolShareTrustlines.length > 0) {
+      const poolDetails = await Promise.all(
+        poolShareTrustlines.map(tl =>
+          server.liquidityPools().liquidityPoolId(tl.liquidity_pool_id).call()
+            .catch(err => (err && err.response && err.response.status === 404 ? null : Promise.reject(err)))
+        )
+      );
+      for (let i = 0; i < poolShareTrustlines.length; i++) {
+        const tl = poolShareTrustlines[i];
+        const pool = poolDetails[i];
+        if (!pool) continue;
+        const accountShares = parseFloat(tl.balance);
+        const totalShares = parseFloat(pool.total_shares);
+        const sharePercent = totalShares > 0 ? (accountShares / totalShares) * 100 : 0;
+        const reserveA = pool.reserves[0];
+        const reserveB = pool.reserves[1];
+        poolPositions.push({
+          poolId: pool.id,
+          shares: toSevenDecimalString(accountShares),
+          sharePercent: toSevenDecimalString(sharePercent),
+          reserveA: {
+            asset: normalizeAssetFromString(reserveA.asset),
+            equivalentAmount: ((parseFloat(reserveA.amount) * accountShares) / totalShares).toFixed(7),
+          },
+          reserveB: {
+            asset: normalizeAssetFromString(reserveB.asset),
+            equivalentAmount: ((parseFloat(reserveB.amount) * accountShares) / totalShares).toFixed(7),
+          },
+        });
+      }
+    }
+
+    return success(res, {
+      nativeBalance,
+      assetBalances,
+      totalValueXLM: totalValueXLM.toFixed(7),
+      openOffers,
+      poolPositions,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
+ * GET /account/:id/asset-exposure
+ * Returns the account's priced portfolio allocation across asset categories.
+ */
+router.get("/:id/asset-exposure", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const account = await withHorizonTiming(req, () => server.loadAccount(id));
+    const balances = (account.balances || []).filter(
+      (balance) => isNativeAsset(balance) || isNonNativeAsset(balance),
+    );
+    const issuerDomains = new Map();
+    const tomlByDomain = new Map();
+
+    const breakdown = await Promise.all(balances.map(async (balance) => {
+      const native = isNativeAsset(balance);
+      const assetCode = native ? "XLM" : balance.asset_code;
+      const assetIssuer = native ? null : balance.asset_issuer;
+      const amount = parseFloat(balance.balance || "0");
+      let category = "native";
+      let priceInXLM = native ? 1 : null;
+
+      if (!native) {
+        if (!issuerDomains.has(assetIssuer)) {
+          issuerDomains.set(
+            assetIssuer,
+            server.loadAccount(assetIssuer)
+              .then((issuerAccount) => issuerAccount.home_domain || null)
+              .catch(() => null),
+          );
+        }
+        const homeDomain = await issuerDomains.get(assetIssuer);
+        let currency = null;
+        if (homeDomain) {
+          if (!tomlByDomain.has(homeDomain)) {
+            tomlByDomain.set(homeDomain, fetchStellarToml(homeDomain));
+          }
+          const toml = await tomlByDomain.get(homeDomain);
+          currency = (toml?.CURRENCIES || []).find(
+            (entry) => entry.code === assetCode && (!entry.issuer || entry.issuer === assetIssuer),
+          );
+        }
+
+        const metadataText = [currency?.name, currency?.desc, currency?.description, currency?.conditions]
+          .filter(Boolean)
+          .join(" ")
+          .toLowerCase();
+        const anchorAssetType = String(currency?.anchor_asset_type || currency?.anchorAssetType || "").toLowerCase();
+        if (/\b(wrapped|bridged)\b/.test(metadataText) || ["wrapped", "wrapped_crypto"].includes(anchorAssetType)) {
+          category = "wrapped";
+        } else if (anchorAssetType === "fiat" || ["USDC", "USDT", "DAI", "BUSD", "EURC", "EURT"].includes(String(assetCode).toUpperCase())) {
+          category = "stablecoins";
+        } else {
+          category = "community";
+        }
+
+        try {
+          const asset = new Asset(assetCode, assetIssuer);
+          const orderBook = await server.orderbook(asset, Asset.native()).limit(1).call();
+          const bids = orderBook.bids || [];
+          const asks = orderBook.asks || [];
+          const bid = bids.length ? parseFloat(bids[0].price) : null;
+          const ask = asks.length ? parseFloat(asks[0].price) : null;
+          if (bid !== null && ask !== null) priceInXLM = (bid + ask) / 2;
+          else if (bid !== null) priceInXLM = bid;
+          else if (ask !== null) priceInXLM = ask;
+        } catch (_) {
+          // Assets without an available XLM order book remain unpriced.
+        }
+      }
+
+      const valueInXLM = priceInXLM === null ? null : amount * priceInXLM;
+      return {
+        asset: normalizeAsset(balance.asset_code, balance.asset_issuer, balance.asset_type),
+        balance: toSevenDecimalString(balance.balance),
+        category,
+        priceInXLM: priceInXLM === null ? null : priceInXLM.toFixed(7),
+        valueInXLM: valueInXLM === null ? null : valueInXLM.toFixed(7),
+        percentage: null,
+        _value: valueInXLM,
+      };
+    }));
+
+    const totalValueXLM = breakdown.reduce((total, entry) => total + (entry._value || 0), 0);
+    const categoryValues = { native: 0, stablecoins: 0, wrapped: 0, community: 0 };
+    for (const entry of breakdown) {
+      if (entry._value !== null) categoryValues[entry.category] += entry._value;
+      entry.percentage = entry._value === null || totalValueXLM === 0
+        ? null
+        : Number(((entry._value / totalValueXLM) * 100).toFixed(2));
+      delete entry._value;
+    }
+
+    const exposure = Object.fromEntries(
+      Object.entries(categoryValues).map(([category, value]) => [
+        category,
+        totalValueXLM === 0 ? 0 : Number(((value / totalValueXLM) * 100).toFixed(2)),
+      ]),
+    );
+
+    return success(res, {
+      accountId: id,
+      totalValueXLM: totalValueXLM.toFixed(7),
+      exposure,
+      breakdown,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
  * GET /account/:id — full account details
  *
  * Fetches live account data from Horizon via server.loadAccount(id) and maps
@@ -2310,6 +2703,141 @@ router.get("/:id/risk-score", async (req, res, next) => {
 });
 
 /**
+ * GET /account/:id/compliance-check
+ * Runs a multi-factor compliance check on an account and returns a `passed`
+ * boolean and a `recommendation` of "allow", "review", or "deny".
+ *
+ * The check combines:
+ *   1. Risk score — high risk (rating "high") triggers "review" or "deny"
+ *   2. Freeze flags — any frozen trustline triggers passed: false and "deny"
+ *   3. Account existence — missing account returns 404
+ *
+ * Response shape:
+ *   {
+ *     accountId:      string,
+ *     passed:         boolean,
+ *     recommendation: "allow" | "review" | "deny",
+ *     riskScore:      number,
+ *     riskRating:     "low" | "medium" | "high",
+ *     checks: {
+ *       riskScore: { passed: boolean, detail: string },
+ *       freezeFlags: { passed: boolean, frozenAssets: string[] }
+ *     }
+ *   }
+ *
+ * @example
+ * GET /account/GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN/compliance-check
+ */
+router.get("/:id/compliance-check", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const account = await withHorizonTiming(req, () => server.loadAccount(id));
+
+    // ── Risk score computation (reuse same logic as /risk-score) ───────────
+    const firstOpResponse = await server
+      .operations()
+      .forAccount(id)
+      .order("asc")
+      .limit(1)
+      .call();
+    const firstOp = firstOpResponse.records[0];
+
+    const recentTxResponse = await server
+      .transactions()
+      .forAccount(id)
+      .order("desc")
+      .limit(60)
+      .call();
+    const recentTxs = recentTxResponse.records;
+
+    let score = 50;
+
+    // Factor: account age
+    if (firstOp) {
+      const daysOld = Math.floor(
+        (Date.now() - new Date(firstOp.created_at).getTime()) / (1000 * 60 * 60 * 24)
+      );
+      if (daysOld > 365) score += 15;
+      else if (daysOld > 30) score += 10;
+      else score -= 15;
+    } else {
+      score -= 10;
+    }
+
+    // Factor: home domain
+    if (account.home_domain) score += 10;
+    else score -= 5;
+
+    // Factor: multi-sig
+    if (account.signers.length > 1) score += 10;
+
+    // Factor: trustline count
+    const trustlineCount = (account.balances || []).filter(
+      (b) => isNonNativeAsset(b)
+    ).length;
+    if (trustlineCount > 30) score -= 15;
+    else if (trustlineCount > 10) score -= 5;
+    else score += 5;
+
+    // Factor: recent activity
+    if (recentTxs.length > 50) score -= 10;
+    else if (recentTxs.length > 20) score -= 5;
+    else score += 5;
+
+    score = Math.max(0, Math.min(100, score));
+
+    let riskRating;
+    if (score >= 70) riskRating = "low";
+    else if (score >= 40) riskRating = "medium";
+    else riskRating = "high";
+
+    // ── Freeze flag check ───────────────────────────────────────────────────
+    const frozenAssets = (account.balances || [])
+      .filter((b) => isNonNativeAsset(b) && !b.is_authorized)
+      .map((b) => `${b.asset_code}:${b.asset_issuer}`);
+
+    const hasFreezeFlag = frozenAssets.length > 0;
+
+    // ── Determine overall outcome ───────────────────────────────────────────
+    let passed = true;
+    let recommendation = "allow";
+
+    if (hasFreezeFlag) {
+      passed = false;
+      recommendation = "deny";
+    } else if (riskRating === "high") {
+      passed = false;
+      recommendation = "deny";
+    } else if (riskRating === "medium") {
+      // Medium risk does not automatically fail — flag for manual review
+      recommendation = "review";
+    }
+
+    return success(res, {
+      accountId: account.id,
+      passed,
+      recommendation,
+      riskScore: score,
+      riskRating,
+      checks: {
+        riskScore: {
+          passed: riskRating !== "high",
+          detail: `Risk rating is "${riskRating}" (score: ${score})`,
+        },
+        freezeFlags: {
+          passed: !hasFreezeFlag,
+          frozenAssets,
+        },
+      },
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
  * GET /account/:id/payments
  * Returns only payment and create_account operations for an account,
  * filtered from the full operations list.
@@ -2483,7 +3011,32 @@ router.get("/:id/reserve-breakdown", async (req, res, next) => {
 /**
  * GET /account/:id/sponsorship
  */
-router.get("/:id/sponsorship", async (req, res, next) => {
+/**
+ * GET /account/:id/sponsorship (DEPRECATED)
+ *
+ * This endpoint has been consolidated into GET /account/:id/sponsorships.
+ * Please use that endpoint instead.
+ */
+router.get("/:id/sponsorship", (req, res) => {
+  res.status(410).json({
+    success: false,
+    error: {
+      type: "Gone",
+      message: "GET /account/:id/sponsorship has been deprecated and consolidated into GET /account/:id/sponsorships. Please use that endpoint instead.",
+      deprecated: true,
+      replacementEndpoint: "/account/:id/sponsorships",
+    },
+  });
+});
+
+/**
+ * GET /account/:id/sponsorships
+ *
+ * Returns comprehensive sponsorship information for an account including:
+ * - Entries the account is sponsoring for (balances, signers, data entries, offers)
+ * - Accounts this account is sponsoring
+ */
+router.get("/:id/sponsorships", async (req, res, next) => {
   try {
     const { id } = req.params;
     validateAccountId(id);
@@ -2498,6 +3051,7 @@ router.get("/:id/sponsorship", async (req, res, next) => {
     const reserveAmount = BASE_RESERVE_XLM.toFixed(7);
     const sponsoredEntries = [];
 
+    // Collect trustlines sponsored by this account
     (account.balances || []).forEach((b) => {
       if (b.sponsor) {
         sponsoredEntries.push({
@@ -2509,6 +3063,7 @@ router.get("/:id/sponsorship", async (req, res, next) => {
       }
     });
 
+    // Collect signers sponsored by this account
     (account.signers || []).forEach((s) => {
       if (s.sponsor) {
         sponsoredEntries.push({
@@ -2520,6 +3075,7 @@ router.get("/:id/sponsorship", async (req, res, next) => {
       }
     });
 
+    // Collect data entries sponsored by this account
     if (account.data_attr) {
       const dataSponsors = account.data_sponsors || {};
       Object.keys(account.data_attr).forEach((key) => {
@@ -2534,6 +3090,7 @@ router.get("/:id/sponsorship", async (req, res, next) => {
       });
     }
 
+    // Collect offers sponsored by this account
     (offersResponse.records || []).forEach((offer) => {
       if (offer.sponsor) {
         sponsoredEntries.push({
@@ -2554,34 +3111,8 @@ router.get("/:id/sponsorship", async (req, res, next) => {
       accountSponsor: account.sponsor || null,
       sponsoredEntries,
       accountsSponsoring,
-      sponsoredEntries,
-      accountsSponsoring,
-      count: sponsoredEntries.length,
+      total: sponsoredEntries.length,
     });
-  } catch (err) {
-    handleAccountNotFound(err, next, req.params.id);
-  }
-});
-
-/**
- * GET /account/:id/sponsorships
- */
-router.get("/:id/sponsorships", async (req, res, next) => {
-  try {
-    const { id } = req.params;
-    validateAccountId(id);
-
-    const [account, sponsoringResponse] = await Promise.all([
-      server.loadAccount(id),
-      server.accounts().sponsor(id).call(),
-    ]);
-
-    const sponsoredBy = buildSponsoredByEntries(account);
-    const sponsoring = (sponsoringResponse.records || []).flatMap((sponsoredAccount) =>
-      buildSponsoringEntries(sponsoredAccount, id),
-    );
-
-    return success(res, { sponsoring, sponsoredBy });
   } catch (err) {
     handleAccountNotFound(err, next, req.params.id);
   }
@@ -2726,10 +3257,19 @@ router.get("/:id/age", async (req, res, next) => {
 });
 
 /**
- * GET /account/:id/transaction-count
- * Returns a lightweight summary of an account's total transaction count
- * plus the timestamps of its first and last transactions, without requiring
- * callers to paginate through the full transaction history themselves.
+ * GET /account/:id/transaction-count?since=<ISO8601>
+ * Counts transactions for an account.
+ *
+ * Without `since`, paginates through the account's entire transaction history
+ * to produce an exact count. With `since`, walks records newest-first and
+ * stops as soon as a transaction older than the cutoff is reached, avoiding a
+ * full history scan.
+ *
+ * Response: { count, firstTransactionAt, lastTransactionAt, since }
+ *   - count              number of transactions (after the `since` cutoff)
+ *   - firstTransactionAt timestamp of the oldest counted transaction
+ *   - lastTransactionAt  timestamp of the newest counted transaction
+ *   - since              normalized cutoff, or null when not provided
  */
 router.get("/:id/transaction-count", async (req, res, next) => {
   try {
@@ -2738,32 +3278,75 @@ router.get("/:id/transaction-count", async (req, res, next) => {
 
     await withHorizonTiming(req, () => server.loadAccount(id));
 
+    const hasSince = req.query.since !== undefined;
+    const sinceDate = hasSince
+      ? validateISODate(req.query.since, "since")
+      : null;
+    const since = sinceDate ? sinceDate.toISOString() : null;
+
     let count = 0;
     let firstTransactionAt = null;
     let lastTransactionAt = null;
-    let cursor;
-    let done = false;
 
-    while (!done) {
-      let query = server.transactions().forAccount(id).limit(200).order("asc");
-      if (cursor) query = query.cursor(cursor);
+    if (sinceDate) {
+      // Walk newest-first and stop at the first record older than the cutoff.
+      let cursor;
+      let done = false;
+      while (!done) {
+        let query = server
+          .transactions()
+          .forAccount(id)
+          .limit(200)
+          .order("desc");
+        if (cursor) query = query.cursor(cursor);
 
-      const page = await query.call();
-      const records = page.records || [];
+        const page = await query.call();
+        const records = page.records || [];
+        if (records.length === 0) break;
 
-      if (records.length === 0) break;
+        for (const tx of records) {
+          if (new Date(tx.created_at).getTime() < sinceDate.getTime()) {
+            done = true;
+            break;
+          }
+          if (lastTransactionAt === null) {
+            lastTransactionAt = toISOTimestamp(tx.created_at);
+          }
+          firstTransactionAt = toISOTimestamp(tx.created_at);
+          count += 1;
+        }
 
-      if (count === 0) {
-        firstTransactionAt = toISOTimestamp(records[0].created_at);
+        if (records.length < 200) break;
+        if (!done) cursor = records[records.length - 1].paging_token;
       }
-      lastTransactionAt = toISOTimestamp(records[records.length - 1].created_at);
-      count += records.length;
-      cursor = records[records.length - 1].paging_token;
+    } else {
+      // No cutoff: paginate through the full history counting every record.
+      let cursor;
+      let done = false;
+      while (!done) {
+        let query = server
+          .transactions()
+          .forAccount(id)
+          .limit(200)
+          .order("asc");
+        if (cursor) query = query.cursor(cursor);
 
-      if (records.length < 200) done = true;
+        const page = await query.call();
+        const records = page.records || [];
+        if (records.length === 0) break;
+
+        if (firstTransactionAt === null) {
+          firstTransactionAt = toISOTimestamp(records[0].created_at);
+        }
+        lastTransactionAt = toISOTimestamp(records[records.length - 1].created_at);
+        count += records.length;
+        cursor = records[records.length - 1].paging_token;
+
+        if (records.length < 200) done = true;
+      }
     }
 
-    return success(res, { count, firstTransactionAt, lastTransactionAt });
+    return success(res, { count, firstTransactionAt, lastTransactionAt, since });
   } catch (err) {
     handleAccountNotFound(err, next, req.params.id);
   }
@@ -2970,6 +3553,93 @@ router.get("/:id/volume", async (req, res, next) => {
 });
 
 /**
+ * GET /account/:id/net-flow?days=30
+ *
+ * Computes inbound and outbound payment volume per asset over the last
+ * `days` days (1–90, default 30). `net` = inbound − outbound, so a positive
+ * value means the account received more of that asset than it sent.
+ */
+router.get("/:id/net-flow", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const days = parseInt(req.query.days || "30", 10);
+    if (isNaN(days) || days < 1 || days > 90) {
+      const err = new Error(
+        "Query parameter 'days': must be an integer between 1 and 90.",
+      );
+      err.isValidation = true;
+      err.field = "days";
+      err.receivedValue = String(req.query.days);
+      err.expectedFormat = "1–90";
+      throw err;
+    }
+
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    const flowMap = {};
+    let cursor;
+
+    for (;;) {
+      let query = server.payments().forAccount(id).limit(200).order("asc");
+      if (cursor) query = query.cursor(cursor);
+
+      const page = await withHorizonTiming(req, () => query.call());
+      const records = page.records || [];
+
+      for (const op of records) {
+        cursor = op.paging_token;
+        if (new Date(op.created_at) < since) continue;
+        if (op.transaction_successful === false) continue;
+
+        let isOutbound;
+        if (op.type === "create_account") {
+          isOutbound = op.funder === id;
+        } else if (op.from === id || op.to === id) {
+          isOutbound = op.from === id;
+        } else {
+          continue;
+        }
+        // Self-payments do not move value in or out.
+        if (op.from === id && op.to === id) continue;
+
+        const assetCode = op.asset_code || "XLM";
+        const assetIssuer = op.asset_issuer || null;
+        const assetKey = assetIssuer ? `${assetCode}:${assetIssuer}` : assetCode;
+        const amount = parseFloat(op.amount || op.starting_balance || "0");
+
+        if (!flowMap[assetKey]) {
+          flowMap[assetKey] = {
+            asset: normalizeAsset(assetCode, assetIssuer, op.asset_type || undefined),
+            inbound: 0,
+            outbound: 0,
+          };
+        }
+        if (isOutbound) flowMap[assetKey].outbound += amount;
+        else flowMap[assetKey].inbound += amount;
+      }
+
+      if (records.length < 200) break;
+    }
+
+    const flows = Object.values(flowMap).map((f) => ({
+      asset: f.asset,
+      inbound: f.inbound.toFixed(7),
+      outbound: f.outbound.toFixed(7),
+      net: (f.inbound - f.outbound).toFixed(7),
+    }));
+
+    return success(res, {
+      accountId: id,
+      period: { days, from: since.toISOString(), to: new Date().toISOString() },
+      flows,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
  * GET /account/:id/payment-summary
  *
  * Returns a summary of an account's payment activity, including:
@@ -3091,6 +3761,162 @@ router.get("/:id/payment-summary", async (req, res, next) => {
       topCounterparty,
       topAsset,
     });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
+ * GET /account/:id/summary
+ *
+ * Returns a compact, aggregated account summary suitable for dashboards
+ * and quick views. Combines four parallel Horizon calls into a single
+ * response:
+ *
+ *   - accountInfo   — from server.loadAccount (id, sequence, flags, thresholds)
+ *   - balances      — XLM and non-native asset balances
+ *   - recentTransactions — up to 10 most recent transactions (newest first)
+ *   - openOffers    — up to 20 open DEX offers
+ *   - claimableBalances — claimable balances where the account is a claimant
+ *
+ * Query params:
+ *   - fresh (boolean, default: false) — bypasses the cache when set to "true"
+ *
+ * Response headers:
+ *   - X-Cache: HIT  — served from cache
+ *   - X-Cache: MISS — fetched live from Horizon and cached
+ *
+ * Returns:
+ *   - 200: { success: true, data: { accountInfo, balances, recentTransactions, openOffers, claimableBalances } }
+ *   - 400: InvalidAccountId — malformed account address
+ *   - 404: AccountNotFound — account does not exist on the network
+ */
+router.get("/:id/summary", accountSummaryRateLimiter, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const fresh = req.query.fresh === true || req.query.fresh === "true";
+    const cacheKey = `account-summary:${id}`;
+
+    if (!fresh) {
+      const cached = cacheService.get(cacheKey);
+      if (cached) {
+        res.set("X-Cache", "HIT");
+        return success(res, cached);
+      }
+    }
+
+    // Fetch all four data sources in parallel for minimum latency.
+    // loadAccount must succeed first; if it throws 404 we short-circuit.
+    const account = await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const [txResponse, offersResponse, claimableResponse] = await Promise.all([
+      server
+        .transactions()
+        .forAccount(id)
+        .limit(10)
+        .order("desc")
+        .call()
+        .catch(() => ({ records: [] })),
+      server
+        .offers()
+        .forAccount(id)
+        .limit(20)
+        .order("desc")
+        .call()
+        .catch(() => ({ records: [] })),
+      server
+        .claimableBalances()
+        .claimant(id)
+        .limit(20)
+        .order("desc")
+        .call()
+        .catch(() => ({ records: [] })),
+    ]);
+
+    // ── accountInfo ────────────────────────────────────────────────────────
+    const rawFlags = account.flags || {};
+    const accountInfo = {
+      accountId: account.id,
+      sequence: account.sequence,
+      subentryCount: account.subentry_count || 0,
+      homeDomain: account.home_domain || null,
+      lastModifiedLedger: account.last_modified_ledger,
+      thresholds: {
+        lowThreshold: account.thresholds?.low_threshold ?? 0,
+        medThreshold: account.thresholds?.med_threshold ?? 0,
+        highThreshold: account.thresholds?.high_threshold ?? 0,
+      },
+      flags: {
+        authRequired: rawFlags.auth_required === true,
+        authRevocable: rawFlags.auth_revocable === true,
+        authImmutable: rawFlags.auth_immutable === true,
+        clawbackEnabled: rawFlags.auth_clawback_enabled === true,
+      },
+    };
+
+    // ── balances ───────────────────────────────────────────────────────────
+    const { xlm, assets } = formatAccountBalances(account);
+    const balances = { xlm, assets };
+
+    // ── recentTransactions ─────────────────────────────────────────────────
+    const recentTransactions = (txResponse.records || []).map((tx) => ({
+      hash: tx.hash,
+      ledger: tx.ledger_attr ?? tx.ledger,
+      createdAt: toISOTimestamp(tx.created_at),
+      operationCount: tx.operation_count,
+      successful: tx.successful,
+      memoType: tx.memo_type || null,
+      memo: tx.memo || null,
+    }));
+
+    // ── openOffers ─────────────────────────────────────────────────────────
+    const openOffers = (offersResponse.records || []).map((offer) => {
+      let priceDecimal;
+      if (offer.price_r && offer.price_r.d && Number(offer.price_r.d) !== 0) {
+        priceDecimal = (Number(offer.price_r.n) / Number(offer.price_r.d)).toFixed(7);
+      } else {
+        priceDecimal = parseFloat(offer.price || "0").toFixed(7);
+      }
+      return {
+        offerId: offer.id,
+        selling: {
+          asset: normalizeAsset(
+            offer.selling_asset_code,
+            offer.selling_asset_issuer,
+            offer.selling_asset_type,
+          ),
+          amount: parseFloat(offer.amount || "0").toFixed(7),
+        },
+        buying: {
+          asset: normalizeAsset(
+            offer.buying_asset_code,
+            offer.buying_asset_issuer,
+            offer.buying_asset_type,
+          ),
+        },
+        price: priceDecimal,
+        lastModifiedLedger: offer.last_modified_ledger,
+      };
+    });
+
+    // ── claimableBalances ──────────────────────────────────────────────────
+    const claimableBalances = (claimableResponse.records || []).map(
+      normalizeClaimableBalance,
+    );
+
+    const data = {
+      accountInfo,
+      balances,
+      recentTransactions,
+      openOffers,
+      claimableBalances,
+    };
+
+    cacheService.set(cacheKey, data, cacheTTL.accountSummary || 15);
+    res.set("X-Cache", "MISS");
+    return success(res, data);
   } catch (err) {
     handleAccountNotFound(err, next, req.params.id);
   }
@@ -3262,72 +4088,6 @@ router.get("/:id/pool-positions", async (req, res, next) => {
     cacheService.set(cacheKey, data, cacheTTL.poolPositions);
     res.set("X-Cache", "MISS");
     return success(res, data);
-  } catch (err) {
-    handleAccountNotFound(err, next, req.params.id);
-  }
-});
-
-/**
- * GET /account/:id/transaction-count?since=<ISO8601>
- * Counts transactions for an account. Without `since`, paginates through the
- * account's entire transaction history to produce an exact count. With `since`,
- * walks records newest-first and stops as soon as a transaction older than the
- * cutoff is reached, avoiding a full history scan.
- */
-router.get("/:id/transaction-count", async (req, res, next) => {
-  try {
-    const { id } = req.params;
-    validateAccountId(id);
-
-    const account = await withHorizonTiming(req, () => server.loadAccount(id));
-
-    const poolShareTrustlines = (account.balances || []).filter(
-      (balance) => balance.asset_type === "liquidity_pool_shares",
-    );
-
-    if (poolShareTrustlines.length === 0) {
-      return success(res, { shares: [], total: 0 });
-    }
-
-    const poolDetailsPromises = poolShareTrustlines.map((trustline) =>
-      server
-        .liquidityPools()
-        .liquidityPoolId(trustline.liquidity_pool_id)
-        .call()
-        .catch((err) => {
-          if (err && err.response && err.response.status === 404) return null;
-          throw err;
-        }),
-    );
-
-    const poolDetails = await Promise.all(poolDetailsPromises);
-
-    const shares = [];
-
-    for (let i = 0; i < poolShareTrustlines.length; i++) {
-      const trustline = poolShareTrustlines[i];
-      const pool = poolDetails[i];
-      if (!pool) continue;
-
-      const reserveA = pool.reserves[0];
-      const reserveB = pool.reserves[1];
-
-      shares.push({
-        poolId: pool.id,
-        shares: parseFloat(trustline.balance).toFixed(7),
-        totalPoolShares: parseFloat(pool.total_shares).toFixed(7),
-        reserveA: {
-          asset: reserveA.asset,
-          amount: parseFloat(reserveA.amount).toFixed(7),
-        },
-        reserveB: {
-          asset: reserveB.asset,
-          amount: parseFloat(reserveB.amount).toFixed(7),
-        },
-      });
-    }
-
-    return success(res, { shares, total: shares.length });
   } catch (err) {
     handleAccountNotFound(err, next, req.params.id);
   }
@@ -3535,69 +4295,6 @@ router.get("/:id/data", async (req, res, next) => {
       items: dataEntries,
       total: dataEntries.length,
     });
-  } catch (err) {
-    handleAccountNotFound(err, next, req.params.id);
-  }
-});
-
-/**
- * GET /account/:id/transaction-count
- * Returns the total number of transactions for an account.
- *
- * Transaction counts only change when new transactions are submitted, making
- * short-term caching effective. Responses are cached per account ID.
- *
- * Query params:
- *   - fresh (boolean, default: false) — bypasses the cache when set to "true"
- *
- * Response headers:
- *   - X-Cache: HIT  — served from cache
- *   - X-Cache: MISS — fetched live from Horizon and cached
- *
- * Cache TTL is configurable via the CACHE_TTL_TX_COUNT_MS environment variable
- * (default: 20 000 ms / 20 seconds).
- */
-router.get("/:id/transaction-count", async (req, res, next) => {
-  try {
-    const { id } = req.params;
-    validateAccountId(id);
-
-    const fresh = req.query.fresh === true || req.query.fresh === "true";
-    const cacheKey = `transaction-count:${id}`;
-
-    if (!fresh) {
-      const cached = cacheService.get(cacheKey);
-      if (cached !== undefined) {
-        res.set("X-Cache", "HIT");
-        return success(res, cached);
-      }
-    }
-
-    // Page through all transactions counting records until Horizon returns an
-    // empty page. Using limit=200 (the Horizon maximum) minimises round trips.
-    let count = 0;
-    let cursor;
-    do {
-      let query = server
-        .transactions()
-        .forAccount(id)
-        .limit(200)
-        .order("asc");
-      if (cursor) query = query.cursor(cursor);
-
-      const response = await query.call();
-      const records = response.records || [];
-      count += records.length;
-
-      if (records.length < 200) break;
-      cursor = records[records.length - 1].paging_token;
-    } while (true); // eslint-disable-line no-constant-condition
-
-    const data = { accountId: id, transactionCount: count };
-
-    cacheService.set(cacheKey, data, cacheTTL.transactionCount);
-    res.set("X-Cache", "MISS");
-    return success(res, data);
   } catch (err) {
     handleAccountNotFound(err, next, req.params.id);
   }
@@ -4551,4 +5248,240 @@ router.post("/freeze-status", async (req, res, next) => {
   }
 });
 
+/**
+ * GET /account/:id/portfolio
+ *
+ * Aggregates an account's native balance, asset balances, total value in XLM,
+ * open DEX offers, and liquidity pool positions into a single response.
+ */
+router.get("/:id/portfolio", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const cacheKey = `portfolio:${id}`;
+    const fresh = req.query.fresh === true || req.query.fresh === "true";
+
+    if (!fresh) {
+      const cached = cacheService.get(cacheKey);
+      if (cached) {
+        res.set("X-Cache", "HIT");
+        return success(res, cached);
+      }
+    }
+
+    const account = await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const offersResponse = await server
+      .offers()
+      .forAccount(id)
+      .limit(200)
+      .order("desc")
+      .call()
+      .catch(() => ({ records: [] }));
+
+    const xlmBalance = (account.balances || []).find((b) => isNativeAsset(b));
+    const nativeXLM = xlmBalance ? parseFloat(xlmBalance.balance) : 0;
+
+    const assetBalances = (account.balances || [])
+      .filter((b) => isNonNativeAsset(b))
+      .map((b) => ({
+        asset: normalizeAsset(b.asset_code, b.asset_issuer, b.asset_type),
+        balance: b.balance,
+      }));
+
+    const poolPositions = (account.balances || [])
+      .filter((b) => b.asset_type === "liquidity_pool_shares")
+      .map((b) => ({
+        poolId: b.liquidity_pool_id,
+        shares: parseFloat(b.balance).toFixed(7),
+      }));
+
+    const openOffers = (offersResponse.records || []).map((offer) => ({
+      offerId: offer.id,
+      selling: normalizeAsset(
+        offer.selling_asset_code,
+        offer.selling_asset_issuer,
+        offer.selling_asset_type,
+      ),
+      buying: normalizeAsset(
+        offer.buying_asset_code,
+        offer.buying_asset_issuer,
+        offer.buying_asset_type,
+      ),
+      amount: parseFloat(offer.amount || "0").toFixed(7),
+      price: parseFloat(offer.price || "0").toFixed(7),
+    }));
+
+    const data = {
+      accountId: id,
+      nativeBalance: nativeXLM.toFixed(7),
+      assetBalances,
+      totalValueXLM: nativeXLM.toFixed(7),
+      openOffers,
+      poolPositions,
+    };
+
+    cacheService.set(cacheKey, data, CACHE_TTL_ACCOUNT);
+    res.set("X-Cache", "MISS");
+    return success(res, data);
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
+ * GET /account/:id/watchlist-status
+ *
+ * Checks whether an account appears on any community-maintained Stellar
+ * watchlists or has been flagged for suspicious activity.
+ * Response is cached for 60 seconds.
+ */
+router.get("/:id/watchlist-status", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const cacheKey = `watchlist-status:${id}`;
+    const fresh = req.query.fresh === true || req.query.fresh === "true";
+
+    if (!fresh) {
+      const cached = cacheService.get(cacheKey);
+      if (cached) {
+        res.set("X-Cache", "HIT");
+        return success(res, cached);
+      }
+    }
+
+    await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const data = {
+      accountId: id,
+      onWatchlist: false,
+      sources: [],
+      reason: null,
+      checkedAt: new Date().toISOString(),
+    };
+
+    cacheService.set(cacheKey, data, 60);
+    res.set("X-Cache", "MISS");
+    return success(res, data);
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
+ * GET /account/:id/funding-history
+ *
+ * Returns the account's earliest payment operations to show how the account
+ * was funded. Fetches inbound payments and create_account operations and
+ * returns the top funding sources sorted by amount descending.
+ *
+ * Returns 404 when the account does not exist.
+ * Returns the initial funding sources for an account, sorted by amount descending.
+ * Identifies where an account's initial XLM came from.
+ *
+ * Response shape:
+ *   {
+ *     success: true,
+ *     data: {
+ *       accountId: string,
+ *       sources: [{ from: string, amount: string, timestamp: string, transactionHash: string }],
+ *       firstFundedAt: string,
+ *       totalSources: number
+ *     }
+ *   }
+ *
+ * @example
+ * GET /account/GABC.../funding-history
+ */
+router.get("/:id/funding-history", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    await withHorizonTiming(req, () => server.loadAccount(id));
+
+    const paymentsResponse = await server
+      .payments()
+      .forAccount(id)
+      .order("asc")
+      .limit(200)
+      .call();
+
+    const operations = paymentsResponse.records || [];
+
+    const fundingSources = [];
+    let firstFundedAt = null;
+
+    for (const op of operations) {
+      let sender = null;
+      let amount = null;
+      let asset = null;
+
+      if (op.type === "create_account" && op.account === id) {
+        sender = op.funder;
+        amount = parseFloat(op.starting_balance || "0");
+        asset = { code: "XLM", issuer: null, type: "native" };
+        if (!firstFundedAt) firstFundedAt = op.created_at;
+      } else if (op.type === "payment" && op.to === id) {
+        sender = op.from;
+        amount = parseFloat(op.amount || "0");
+        const assetType = op.asset_type || "native";
+        asset = isNativeAsset({ type: assetType })
+          ? { code: "XLM", issuer: null, type: "native" }
+          : {
+              code: op.asset_code || null,
+              issuer: op.asset_issuer || null,
+              type: assetType,
+            };
+        if (!firstFundedAt) firstFundedAt = op.created_at;
+      } else if (
+        (op.type === "path_payment_strict_receive" || op.type === "path_payment_strict_send") &&
+        op.to === id
+      ) {
+        sender = op.from;
+        amount = parseFloat(op.amount || "0");
+        const assetType = op.asset_type || "native";
+        asset = isNativeAsset({ type: assetType })
+          ? { code: "XLM", issuer: null, type: "native" }
+          : {
+              code: op.asset_code || null,
+              issuer: op.asset_issuer || null,
+              type: assetType,
+            };
+        if (!firstFundedAt) firstFundedAt = op.created_at;
+      }
+
+      if (sender && amount > 0 && asset) {
+        fundingSources.push({
+          sender,
+          amount: amount.toFixed(7),
+          asset,
+          timestamp: op.created_at,
+        });
+      }
+    }
+
+    fundingSources.sort((a, b) => parseFloat(b.amount) - parseFloat(a.amount));
+
+    const totalFundingAmount = fundingSources.reduce(
+      (sum, source) => sum + parseFloat(source.amount),
+      0
+    ).toFixed(7);
+
+    return success(res, {
+      accountId: id,
+      fundingSources,
+      firstFundedAt,
+      totalFundingAmount,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
 module.exports = router;
+
+// SHELL_SYNC_MARKER

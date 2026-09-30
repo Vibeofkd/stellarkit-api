@@ -2,7 +2,7 @@ const express = require("express");
 const router = express.Router();
 const accountRouter = require("./account");
 const { server, NETWORK } = require("../config/stellar");
-const { success } = require("../utils/response");
+const { success, toISOTimestamp } = require("../utils/response");
 const {
   validateAccountId,
   validateAssetCode,
@@ -449,6 +449,176 @@ router.post("/signers", async (req, res, next) => {
         }
       }),
     );
+
+    return success(res, { results });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * POST /accounts/transaction-counts
+ *
+ * Returns the transaction count for up to 20 Stellar accounts in a single
+ * response. Designed for leaderboards and analytics dashboards that need
+ * transaction counts for multiple accounts without issuing one request per account.
+ *
+ * Each account is paged through its full transaction history on Horizon to
+ * produce an exact count, plus the timestamps of the first and last transactions.
+ *
+ * Request body:
+ *   { "addresses": ["G...", "G..."] }   (max 20 addresses)
+ *
+ * Response:
+ *   {
+ *     "success": true,
+ *     "data": {
+ *       "results": {
+ *         "G...": {
+ *           "count": 42,
+ *           "firstTransactionAt": "2021-01-01T00:00:00.000Z",
+ *           "lastTransactionAt":  "2024-06-15T12:30:00.000Z"
+ *         },
+ *         "G...": {
+ *           "count": 0,
+ *           "firstTransactionAt": null,
+ *           "lastTransactionAt":  null
+ *         }
+ *       }
+ *     }
+ *   }
+ *
+ * - Non-existent accounts return { count: 0, firstTransactionAt: null, lastTransactionAt: null }
+ * - Exceeding 20 addresses returns 400
+ * - Invalid addresses return 400
+ *
+ * @example
+ * POST /accounts/transaction-counts
+ * { "addresses": ["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN"] }
+ */
+
+const MAX_TRANSACTION_COUNT_ADDRESSES = 20;
+
+/**
+ * Paginates through all transactions for a single address and returns
+ * { count, firstTransactionAt, lastTransactionAt }.
+ *
+ * Non-existent accounts (Horizon 404) return zero-count result rather than
+ * throwing so the whole batch can still succeed.
+ *
+ * @param {string} address - Stellar public key
+ * @returns {Promise<{ count: number, firstTransactionAt: string|null, lastTransactionAt: string|null }>}
+ */
+async function fetchTransactionCount(address) {
+  let count = 0;
+  let firstTransactionAt = null;
+  let lastTransactionAt = null;
+  let cursor;
+
+  try {
+    do {
+      let query = server
+        .transactions()
+        .forAccount(address)
+        .limit(200)
+        .order("asc");
+
+      if (cursor) query = query.cursor(cursor);
+
+      const page = await query.call();
+      const records = page.records || [];
+
+      if (records.length === 0) break;
+
+      // First page: capture the timestamp of the very first transaction
+      if (count === 0 && records.length > 0) {
+        firstTransactionAt = toISOTimestamp(records[0].created_at);
+      }
+
+      // Always update lastTransactionAt to the last record on each page
+      lastTransactionAt = toISOTimestamp(records[records.length - 1].created_at);
+      count += records.length;
+      cursor = records[records.length - 1].paging_token;
+
+      if (records.length < 200) break;
+    } while (true); // eslint-disable-line no-constant-condition
+  } catch (err) {
+    // Horizon 404 means account does not exist — return zeroed result
+    if (err && err.response && err.response.status === 404) {
+      return { count: 0, firstTransactionAt: null, lastTransactionAt: null };
+    }
+    throw err;
+  }
+
+  return { count, firstTransactionAt, lastTransactionAt };
+}
+
+router.post("/transaction-counts", async (req, res, next) => {
+  try {
+    const { addresses } = req.body || {};
+
+    // ── Input validation ─────────────────────────────────────────────────────
+
+    if (!addresses || !Array.isArray(addresses)) {
+      const err = new Error("Request body must include a non-empty 'addresses' array.");
+      err.isValidation = true;
+      err.field = "addresses";
+      err.receivedValue = typeof addresses;
+      err.expectedFormat = "Array of Stellar public keys (G... addresses)";
+      err.status = 400;
+      return next(err);
+    }
+
+    if (addresses.length === 0) {
+      const err = new Error("Property 'addresses' must contain at least one address.");
+      err.isValidation = true;
+      err.field = "addresses";
+      err.receivedValue = "[]";
+      err.expectedFormat = "Non-empty array of Stellar public keys";
+      err.status = 400;
+      return next(err);
+    }
+
+    if (addresses.length > MAX_TRANSACTION_COUNT_ADDRESSES) {
+      const err = new Error(
+        `Too many addresses: received ${addresses.length}, maximum is ${MAX_TRANSACTION_COUNT_ADDRESSES}.`
+      );
+      err.isValidation = true;
+      err.field = "addresses";
+      err.receivedValue = String(addresses.length);
+      err.expectedFormat = `Array of 1–${MAX_TRANSACTION_COUNT_ADDRESSES} Stellar public keys`;
+      err.status = 400;
+      return next(err);
+    }
+
+    // Validate every address format before hitting Horizon
+    for (const addr of addresses) {
+      validateAccountId(addr);
+    }
+
+    // ── Parallel fetches ─────────────────────────────────────────────────────
+    // All addresses are fetched in parallel. fetchTransactionCount handles
+    // per-address Horizon 404s internally, so Promise.allSettled is a safety
+    // net for truly unexpected throws only.
+    const settled = await Promise.allSettled(
+      addresses.map((addr) => fetchTransactionCount(addr))
+    );
+
+    const results = {};
+    for (let i = 0; i < addresses.length; i++) {
+      const outcome = settled[i];
+      if (outcome.status === "fulfilled") {
+        results[addresses[i]] = outcome.value;
+      } else {
+        // Unexpected rejection — surface a zero-count result so the batch
+        // response is complete even when a single address fails unexpectedly.
+        results[addresses[i]] = {
+          count: 0,
+          firstTransactionAt: null,
+          lastTransactionAt: null,
+        };
+      }
+    }
 
     return success(res, { results });
   } catch (err) {

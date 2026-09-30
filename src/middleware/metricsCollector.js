@@ -18,11 +18,13 @@ function metricsCollector(req, res, next) {
     const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
     const responseTimeMs = Math.round(elapsedMs * 1000) / 1000;
 
-    metricsService.record({
-      statusCode: res.statusCode,
-      responseTimeMs,
-      xCache: res.getHeader("X-Cache"),
-    });
+    if (typeof metricsService.record === "function") {
+      metricsService.record({
+        statusCode: res.statusCode,
+        responseTimeMs,
+        xCache: res.getHeader("X-Cache"),
+      });
+    }
   });
 
   next();

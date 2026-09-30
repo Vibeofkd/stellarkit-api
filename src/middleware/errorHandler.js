@@ -1,16 +1,12 @@
 /**
  * Centralised error handler middleware.
  * Formats Horizon / Stellar SDK errors into consistent JSON responses.
- * All non-Horizon errors are wrapped in StellaKitError for consistency.
- *
- * Production safety: stack traces and internal file paths are never included
- * in responses when NODE_ENV=production. Full error details remain available
- * in development and test environments.
+ * All non-Horizon errors are wrapped in StellarKitError for consistency.
  */
 const logger = require("../utils/logger");
 const { translateHorizonError } = require("../utils/horizonErrors");
 const { mapHorizonErrorToStatus } = require("../utils/horizonStatusMapper");
-const StellaKitError = require("../utils/StellarKitError");
+const StellarKitError = require("../utils/StellarKitError");
 const {
   HORIZON_TIMEOUT_MESSAGE,
   HORIZON_TIMEOUT_SUGGESTION,
@@ -80,6 +76,7 @@ function logError(status, req, message) {
 
 /**
  * Send an error response AND record the status code in the metrics service.
+ * Also tracks the error per-endpoint (route + method combination).
  *
  * @param {import('express').Response} res
  * @param {number} status
@@ -87,6 +84,19 @@ function logError(status, req, message) {
  */
 function errorResponse(res, status, body) {
   metrics.incrementError(status);
+
+  // Track error per endpoint (route + method combination)
+  const req = res.req;
+  if (req) {
+    const method = req.method;
+    // Use the Express matched route pattern when available so dynamic segments
+    // like /account/:id are grouped together rather than tracked per unique ID.
+    const routePattern = (req.route && req.route.path)
+      ? (req.baseUrl || "") + req.route.path
+      : req.path;
+    metrics.incrementErrorByEndpoint(method, routePattern, status);
+  }
+
   return res.status(status).json(body);
 }
 
@@ -393,6 +403,19 @@ function errorHandler(err, req, res, next) {
         message: err.message,
         suggestion:
           "Verify the issuer has a valid stellar.toml at their home domain. See https://developers.stellar.org/docs/issuing-assets/publishing-asset-info for requirements.",
+      },
+    }, req));
+  }
+
+  // InvalidAsset errors — thrown by validateAsset(code, issuer)
+  if (err.isInvalidAsset) {
+    logError(400, req, err.message);
+    return errorResponse(res, 400, withRequestId({
+      success: false,
+      error: {
+        type: "InvalidAsset",
+        message: err.message,
+        suggestion: err.suggestion || undefined,
       },
     }, req));
   }

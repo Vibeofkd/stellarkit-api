@@ -1,3 +1,25 @@
+// Registered route files (alphabetical order):
+//   account.counterparties  → /account/:id/counterparties
+//   account                 → /account/:id/*
+//   accounts                → /accounts/*
+//   asset                   → /asset/*
+//   cacheStats              → /cache/*
+//   claimableBalances       → /claimable-balances/*
+//   dex                     → /dex/*
+//   feeEstimate             → /fee-estimate/*
+//   liquidityPool           → /liquidity-pools/*
+//   metrics                 → /metrics
+//   network                 → /network/*
+//   networkStatus           → /network-status
+//   soroban                 → /soroban/*
+//   stellarToml             → /stellar-toml/*
+//   stream                  → /stream/*
+//   transaction.effects     → /transaction/:hash/effects
+//   transactions            → /transactions/*
+//   utils                   → /utils/*
+//   webhooks                → /webhooks/*
+//   assetsOverview          → /assets-overview
+
 require("dotenv").config();
 const express = require("express");
 const helmet = require("helmet");
@@ -32,7 +54,6 @@ const coerceQueryParams = require("./middleware/coerceQueryParams");
 const etagMiddleware = require("./middleware/etag");
 const routeCounter = require("./middleware/routeCounter");
 const metricsService = require("./services/metrics");
-const routeCounter = require("./middleware/routeCounter");
 
 const networkStatusRouter = require("./routes/networkStatus");
 const webhooksRouter = require("./routes/webhooks");
@@ -55,7 +76,6 @@ const metricsRouter = require("./routes/metrics");
 const sorobanRouter = require("./routes/soroban");
 const networkRouter = require("./routes/network");
 const assetsOverviewRouter = require("./routes/assetsOverview");
-const metricsRouter = require("./routes/metrics");
 
 const app = express();
 // Disable server identification header for security
@@ -177,7 +197,34 @@ app.use(helmet());
 app.use(restrictHttpMethods);
 // Skip compression for responses smaller than 1 KB — gzip headers alone can exceed tiny payloads
 app.use(compression({ threshold: 1024 }));
-app.use(cors());
+// CORS configuration
+const allowedOriginsEnv = process.env.ALLOWED_ORIGINS;
+if (allowedOriginsEnv) {
+  const allowedOrigins = allowedOriginsEnv.split(",").map((o) => o.trim());
+  app.use((req, res, next) => {
+    const origin = req.headers.origin;
+    if (origin) {
+      if (allowedOrigins.includes(origin)) {
+        cors({
+          origin: (originVal, callback) => callback(null, true),
+          credentials: true,
+        })(req, res, next);
+      } else {
+        return res.status(403).json({
+          success: false,
+          error: {
+            type: "Forbidden",
+            message: "Origin not allowed by CORS policy.",
+          },
+        });
+      }
+    } else {
+      next();
+    }
+  });
+} else {
+  app.use(cors());
+}
 app.use(requestIdMiddleware);
 app.use(requestLogger);
 app.use(metricsCollector);
@@ -186,17 +233,18 @@ app.use(bodySizeLimit);
 app.use(rejectDuplicateQueryParams);
 app.use(hpp({ whitelist: ["limit", "order", "cursor", "operations"] }));
 
+// ── Metrics request counter ─────────────────────────────────────────────────
+// Count ALL requests (including /metrics) before routing
+app.use((req, res, next) => {
+  metricsService.incrementRequests();
+  next();
+});
+
 // ── Metrics (excluded from rate limiting) ───────────────────────────────────
 app.use("/metrics", metricsRouter);
 
 // ── Rate Limiting ───────────────────────────────────────────────────────────
 app.use(rateLimiter);
-
-// ── Metrics request counter ─────────────────────────────────────────────────
-app.use((req, res, next) => {
-  metricsService.incrementRequests();
-  next();
-});
 
 // ── Input Sanitization ──────────────────────────────────────────────────────
 app.use(sanitize);
@@ -375,7 +423,7 @@ app.get("/", (req, res) => {
         { method: "GET", path: "/dex/price/:sellAsset/:buyAsset", description: "Calculate effective exchange rate via best DEX payment path" },
         { method: "GET", path: "/liquidity-pools/:id/profitability", description: "Estimate annualized fee income for a liquidity pool" },
         { method: "GET", path: "/liquidity-pools/:id/reserve-ratio", description: "Get reserve ratio and drift from equal for a liquidity pool" },
-        { method: "GET", path: "/assets-overview", description: "Summary of total assets, trustlines, liquidity pools, and top 5 assets by trustline count"},
+        { method: "GET", path: "/assets-overview", description: "Summary of total assets, trustlines, liquidity pools, and top 5 assets by trustline count" },
         { method: "GET", path: "/utils/friendbot/:accountId", description: "Fund a testnet account via Friendbot (testnet only)" },
         { method: "GET", path: "/utils/convert?xlm=:xlm", description: "Convert between XLM and stroops" },
         { method: "GET", path: "/utils/validate-account?id=:id", description: "Validate a Stellar public key format (no Horizon call)" },
@@ -384,6 +432,8 @@ app.get("/", (req, res) => {
         { method: "GET", path: "/soroban/contract/:id", description: "Soroban contract instance details (executable type, wasm hash)" },
         { method: "GET", path: "/soroban/contract/:id/storage", description: "Soroban contract instance-storage entries" },
         { method: "GET", path: "/soroban/contract/:id/functions", description: "Exported Soroban contract function signatures parsed from the contract ABI" },
+        { method: "GET", path: "/soroban/contract/:id/invoke-simulation", description: "Simulate a Soroban contract function invocation to estimate fees and resource usage without submitting to the network" },
+        { method: "POST", path: "/accounts/transaction-counts", description: "Batch transaction count lookup for up to 20 accounts including first and last transaction timestamps" },
         { method: "GET", path: "/liquidity-pools/:id", description: "Live Horizon liquidity pool details" },
         {
           method: "GET",

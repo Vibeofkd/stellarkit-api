@@ -22,6 +22,9 @@ function makeInvalidAccountIdError(accountId) {
     `""${String(accountId).slice(0, 60)}" is not a valid Stellar account address.`
   );
   err.isInvalidAccountId = true;
+  // Stable marker used by the minResponseTime middleware to identify
+  // synchronous format rejections (which never touch Horizon).
+  err.type = "InvalidAccountId";
   err.accountId = accountId;
   err.suggestion = "Account addresses start with G and are 56 characters long.";
   err.status = 400;
@@ -165,7 +168,11 @@ function validateAssetCode(code) {
 function validateLimit(limit, max = 100) {
   const parsed = parseInt(limit, 10);
   if (isNaN(parsed) || parsed < 1 || parsed > max) {
-    const err = new Error("limit must be a number between 1 and 100.");
+    const defaultMessage = "limit must be a number between 1 and 100.";
+    const message = max !== 100
+      ? `limit must be a number between 1 and ${max}.`
+      : defaultMessage;
+    const err = new Error(message);
     err.isInvalidLimit = true;
     err.status = 400;
     err.receivedValue = limit !== undefined ? String(limit).slice(0, 50) : undefined;
@@ -344,6 +351,20 @@ function validateTransactionHash(hash) {
   return hash;
 }
 
+/**
+ * Returns true when the given string is a valid Stellar liquidity pool ID.
+ *
+ * A pool ID is a 64-character lowercase hexadecimal string as returned by
+ * Horizon. We validate the format before hitting Horizon so callers receive a
+ * clean 400 error rather than a Horizon 404 for a syntactically wrong ID.
+ *
+ * @param {string|null|undefined} poolId
+ * @returns {boolean}
+ */
+function isValidPoolId(poolId) {
+  return typeof poolId === "string" && /^[0-9a-f]{64}$/.test(poolId);
+}
+
 module.exports = {
   validateAccountId,
   validateContractId,
@@ -356,4 +377,5 @@ module.exports = {
   validateStellarAddress,
   validateCredentialType,
   validateTransactionHash,
+  isValidPoolId,
 };
