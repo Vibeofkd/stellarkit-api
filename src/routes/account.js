@@ -51,7 +51,7 @@ const axios = require("axios");
 const { Asset } = require("@stellar/stellar-sdk");
 const { normalizeAsset, normalizeAssetFromString } = require("../utils/asset");
 const { isNativeAsset, isNonNativeAsset } = require("../utils/assetHelpers");
-const { getAssetMetadataFromToml } = require("../utils/tomlResolver");
+const { getAssetMetadataFromToml, fetchStellarToml } = require("../utils/tomlResolver");
 const { formatBalance } = require("../utils/formatBalance");
 const { parseStellarAmount } = require("../utils/parseStellarAmount");
 const { formatAmount } = require("../utils/formatAmount");
@@ -2261,6 +2261,119 @@ router.get("/:id/portfolio", async (req, res, next) => {
       totalValueXLM: totalValueXLM.toFixed(7),
       openOffers,
       poolPositions,
+    });
+  } catch (err) {
+    handleAccountNotFound(err, next, req.params.id);
+  }
+});
+
+/**
+ * GET /account/:id/asset-exposure
+ * Returns the account's priced portfolio allocation across asset categories.
+ */
+router.get("/:id/asset-exposure", async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    validateAccountId(id);
+
+    const account = await withHorizonTiming(req, () => server.loadAccount(id));
+    const balances = (account.balances || []).filter(
+      (balance) => isNativeAsset(balance) || isNonNativeAsset(balance),
+    );
+    const issuerDomains = new Map();
+    const tomlByDomain = new Map();
+
+    const breakdown = await Promise.all(balances.map(async (balance) => {
+      const native = isNativeAsset(balance);
+      const assetCode = native ? "XLM" : balance.asset_code;
+      const assetIssuer = native ? null : balance.asset_issuer;
+      const amount = parseFloat(balance.balance || "0");
+      let category = "native";
+      let priceInXLM = native ? 1 : null;
+
+      if (!native) {
+        if (!issuerDomains.has(assetIssuer)) {
+          issuerDomains.set(
+            assetIssuer,
+            server.loadAccount(assetIssuer)
+              .then((issuerAccount) => issuerAccount.home_domain || null)
+              .catch(() => null),
+          );
+        }
+        const homeDomain = await issuerDomains.get(assetIssuer);
+        let currency = null;
+        if (homeDomain) {
+          if (!tomlByDomain.has(homeDomain)) {
+            tomlByDomain.set(homeDomain, fetchStellarToml(homeDomain));
+          }
+          const toml = await tomlByDomain.get(homeDomain);
+          currency = (toml?.CURRENCIES || []).find(
+            (entry) => entry.code === assetCode && (!entry.issuer || entry.issuer === assetIssuer),
+          );
+        }
+
+        const metadataText = [currency?.name, currency?.desc, currency?.description, currency?.conditions]
+          .filter(Boolean)
+          .join(" ")
+          .toLowerCase();
+        const anchorAssetType = String(currency?.anchor_asset_type || currency?.anchorAssetType || "").toLowerCase();
+        if (/\b(wrapped|bridged)\b/.test(metadataText) || ["wrapped", "wrapped_crypto"].includes(anchorAssetType)) {
+          category = "wrapped";
+        } else if (anchorAssetType === "fiat" || ["USDC", "USDT", "DAI", "BUSD", "EURC", "EURT"].includes(String(assetCode).toUpperCase())) {
+          category = "stablecoins";
+        } else {
+          category = "community";
+        }
+
+        try {
+          const asset = new Asset(assetCode, assetIssuer);
+          const orderBook = await server.orderbook(asset, Asset.native()).limit(1).call();
+          const bids = orderBook.bids || [];
+          const asks = orderBook.asks || [];
+          const bid = bids.length ? parseFloat(bids[0].price) : null;
+          const ask = asks.length ? parseFloat(asks[0].price) : null;
+          if (bid !== null && ask !== null) priceInXLM = (bid + ask) / 2;
+          else if (bid !== null) priceInXLM = bid;
+          else if (ask !== null) priceInXLM = ask;
+        } catch (_) {
+          // Assets without an available XLM order book remain unpriced.
+        }
+      }
+
+      const valueInXLM = priceInXLM === null ? null : amount * priceInXLM;
+      return {
+        asset: normalizeAsset(balance.asset_code, balance.asset_issuer, balance.asset_type),
+        balance: toSevenDecimalString(balance.balance),
+        category,
+        priceInXLM: priceInXLM === null ? null : priceInXLM.toFixed(7),
+        valueInXLM: valueInXLM === null ? null : valueInXLM.toFixed(7),
+        percentage: null,
+        _value: valueInXLM,
+      };
+    }));
+
+    const totalValueXLM = breakdown.reduce((total, entry) => total + (entry._value || 0), 0);
+    const categoryValues = { native: 0, stablecoins: 0, wrapped: 0, community: 0 };
+    for (const entry of breakdown) {
+      if (entry._value !== null) categoryValues[entry.category] += entry._value;
+      entry.percentage = entry._value === null || totalValueXLM === 0
+        ? null
+        : Number(((entry._value / totalValueXLM) * 100).toFixed(2));
+      delete entry._value;
+    }
+
+    const exposure = Object.fromEntries(
+      Object.entries(categoryValues).map(([category, value]) => [
+        category,
+        totalValueXLM === 0 ? 0 : Number(((value / totalValueXLM) * 100).toFixed(2)),
+      ]),
+    );
+
+    return success(res, {
+      accountId: id,
+      totalValueXLM: totalValueXLM.toFixed(7),
+      exposure,
+      breakdown,
     });
   } catch (err) {
     handleAccountNotFound(err, next, req.params.id);
